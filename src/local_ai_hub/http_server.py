@@ -732,6 +732,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _debug_stage(self, name: str) -> None:
+        """Record a fixed stage label without request content or project paths."""
+        trace_id = str(getattr(self, "_debug_trace_id", "") or "")
+        store = getattr(APP, "debug_traces", None) if APP is not None else None
+        if not trace_id or store is None:
+            return
+        try:
+            store.event(trace_id, "handler_stage", {"stage": str(name)[:80]})
+        except Exception:
+            pass
+
     def _redact_debug_trace(self) -> None:
         """Keep in-memory conversation transcripts out of durable debug traces."""
         token = getattr(self, "_debug_observer_token", None)
@@ -2003,7 +2014,9 @@ class Handler(BaseHTTPRequestHandler):
         self._journal_request_id = str(getattr(self, "_trace_request_id", ""))
         self._journal_finished = False
         try:
+            self._debug_stage("recovery.lookup.start")
             prior = APP.recovery.lookup(self._journal_request_id, tenant, path)
+            self._debug_stage("recovery.lookup.done")
             if prior and prior.get("state") in {"done", "failed"} and prior.get("response") is not None:
                 self._journal_finished = True
                 self._send(int(prior.get("status_code") or (200 if prior.get("state") == "done" else 500)), prior["response"]); return
@@ -2018,7 +2031,9 @@ class Handler(BaseHTTPRequestHandler):
             if prior and prior.get("state") == "conflict":
                 self._journal_finished = True
                 self._send(409, {"success": False, "error": prior.get("error", "request id conflict")}); return
+            self._debug_stage("recovery.begin.start")
             APP.recovery.begin(self._journal_request_id, tenant, path)
+            self._debug_stage("recovery.begin.done")
         except Exception:
             pass
         try:
@@ -3323,7 +3338,7 @@ class Handler(BaseHTTPRequestHandler):
                 # FIM completion routed through APP.services with caching / APP.scheduler.submit
                 self._send(200, APP.services.complete_code(payload, tenant)); return
             if path == "/api/preprocess":
-                self._send(200, APP.services.preprocess(payload)); return
+                self._send(200, APP.services.preprocess(payload, progress=self._debug_stage)); return
             if path in {"/api/repo/dead_code", "/api/dead_code"}:
                 root = str(payload.get("root", "."))
                 limit = int(payload.get("limit", 50))
@@ -3432,12 +3447,15 @@ class Handler(BaseHTTPRequestHandler):
                     int(payload.get("max_dependents", APP.config.get("workflow", {}).get("impact_max_dependents", 30))),
                 )); return
             if path == "/api/search":
+                self._debug_stage("repo_search.start")
                 self._send(200, APP.services.repo_search(
                     str(payload.get("root", ".")),
                     str(payload.get("query", "")),
                     int(payload.get("top_k", 12)),
                     context_lines=int(payload["context_lines"]) if payload.get("context_lines") is not None else None,
                     enrich=bool(payload.get("enrich", False)),
+                    progress=self._debug_stage,
+                    path=str(payload.get("path") or ""),
                 )); return
             if path == "/api/context/pack":
                 root = str(payload.get("root", ".")); query_text = str(payload.get("query", ""))

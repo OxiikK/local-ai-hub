@@ -846,15 +846,16 @@ def _quality_check_semantic_result(
     evidence_paths = [str(path) for path in (changed_paths or []) if str(path).strip()]
     if not evidence_paths:
         evidence_paths = list(dict.fromkeys(_SEMANTIC_PATH_RE.findall(context)))[:64]
-    if not evidence_paths:
-        return result
-    quality = assess_semantic_result(task, evidence_paths, result)
+    quality = assess_semantic_result(task, evidence_paths, result, context=context)
     result["advisory_only"] = True
     result["semantic_quality"] = quality
     if not quality.get("usable", False):
         reason = quality.get("bypass_reason", quality.get("reason", "quality_gate"))
         result["quality_warning"] = f"advisory semantic output requires verification: {reason}"
         result["bypass_reason"] = reason
+    else:
+        result.pop("quality_warning", None)
+        result.pop("bypass_reason", None)
     return result
 
 
@@ -1306,6 +1307,11 @@ def local_ai_task(
     local model. Skip when: local-model tasks are disabled or Codex-owned
     subagent orchestration is the right owner; Local AI Hub does not route or manage native Codex agents."""
     action = _resolve_action("task", action)
+    if action == "reason":
+        task = task if task.strip() else prompt
+        if not task.strip():
+            return {"success": False, "terminal": True, "retryable": False,
+                    "error_code": "empty_reason_input", "error": "reason requires non-empty task or prompt"}
     # The static contract requires summary, evidence, analysis, limitations
     # and next step. Requests below this floor routinely truncate after a
     # generic preamble, especially on 7b/9b models. Clamp instead of rejecting
@@ -1807,6 +1813,7 @@ def _local_ai_repo_impl(
             extra.extend(["text", "raw"])
         return _compact(CLIENT.post("/api/search", {
             "root": root, "query": query or task, "top_k": 12, "enrich": enrich,
+            **({"path": path} if path else {}),
         }, timeout=_timeout("quick")), "search", extra_fields=extra if extra else None)
     if action == "map":
         return _compact(CLIENT.post("/api/repo/map", {"root": root, "max_symbols": 100}, timeout=_timeout("quick")), "architecture")

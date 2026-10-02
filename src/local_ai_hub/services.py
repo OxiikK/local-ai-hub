@@ -1329,25 +1329,26 @@ class LocalAIServices:
             semantic_query=task, semantic_context_fingerprint=stable_hash(context),
             format=format_val,
         )
-        result = self._apply_semantic_quality(result, task=task, evidence_paths=args.get("changed_paths") or ())
+        result = self._apply_semantic_quality(result, task=task, evidence_paths=args.get("changed_paths") or (), context=context)
         result["route"] = route
         return result
 
     @staticmethod
-    def _apply_semantic_quality(result: dict[str, Any], *, task: str, evidence_paths: Any) -> dict[str, Any]:
+    def _apply_semantic_quality(result: dict[str, Any], *, task: str, evidence_paths: Any, context: str = "") -> dict[str, Any]:
         """Reject obvious ungrounded model paths while keeping output advisory."""
         if not isinstance(result, dict) or not result.get("success", "error" not in result):
             return result
         paths = evidence_paths if isinstance(evidence_paths, (list, tuple, set)) else ()
-        if not paths:
-            return result
-        quality = assess_semantic_result(task, [str(path) for path in paths], result)
+        quality = assess_semantic_result(task, [str(path) for path in paths], result, context=context)
         result["advisory_only"] = True
         result["semantic_quality"] = quality
         if not quality.get("usable", False):
             reason = quality.get("bypass_reason", quality.get("reason", "quality_gate"))
             result["quality_warning"] = f"advisory semantic output requires verification: {reason}"
             result["bypass_reason"] = reason
+        else:
+            result.pop("quality_warning", None)
+            result.pop("bypass_reason", None)
         return result
 
     def delegate_profile(self, args: dict[str, Any], tenant: str) -> dict[str, Any]:
@@ -1423,7 +1424,11 @@ class LocalAIServices:
     def reason(self, args: dict[str, Any], tenant: str) -> dict[str, Any]:
         payload = dict(args)
         payload["task_type"] = "reasoning"
-        payload["task"] = str(args.get("problem", args.get("task", "")))
+        payload["task"] = next((str(args.get(key) or "") for key in ("problem", "task", "prompt")
+                                if str(args.get(key) or "").strip()), "")
+        if not payload["task"]:
+            return {"success": False, "terminal": True, "retryable": False,
+                    "error_code": "empty_reason_input", "error": "reason requires non-empty problem, task or prompt"}
         payload["operation"] = str(args.get("operation", "reason"))
         payload.setdefault("max_tokens", 4096)
         return self.delegate(payload, tenant)
@@ -1471,7 +1476,7 @@ class LocalAIServices:
             tenant, "second-opinion", int(args.get("priority", 6)),
             semantic_query=f"{question}\n{focus}", semantic_context_fingerprint=stable_hash({"candidate": candidate, "context": context}),
         )
-        result = self._apply_semantic_quality(result, task=question, evidence_paths=args.get("changed_paths") or ())
+        result = self._apply_semantic_quality(result, task=question, evidence_paths=args.get("changed_paths") or (), context=context)
         result["route"] = route
         return result
 
@@ -2545,7 +2550,19 @@ class LocalAIServices:
     def repo_profile(self, root: str) -> dict[str, Any]:
         return self._repo_cached("profile", root, {}, lambda: self.repo_tools.project_profile(root))
 
-    def repo_search(self, root: str, query: str, top_k: int = 12, context_lines: int | None = None, enrich: bool = False) -> dict[str, Any]:
+    def repo_search(self, root: str, query: str, top_k: int = 12, context_lines: int | None = None, enrich: bool = False, progress: Any = None, path: str = "") -> dict[str, Any]:
+        try:
+            scope = RepositoryTools.normalize_search_scope(root, path) if path else ""
+        except ValueError as exc:
+            return {"success": False, "terminal": True, "retryable": False, "error": str(exc)}
+        scope_args = {"path": scope} if scope else {}
+        def stage(name: str) -> None:
+            if progress is not None:
+                try:
+                    progress(name)
+                except Exception:
+                    pass
+
         if enrich and not rollout_feature_enabled(self.config, "enriched_search"):
             return {
                 "success": False,
@@ -2558,43 +2575,58 @@ class LocalAIServices:
         query = normalize_query(query).casefold()
         eff_ctx_lines = int(context_lines) if context_lines is not None else (8 if enrich else None)
         if self.learner is not None:
+            stage("learner.start")
             try: self.learner.record(root, query)
             except Exception: pass
+            stage("learner.done")
         # Local AI deterministic facts/symbols are the cheapest candidate source.
         paths: list[str] = []
         if self.deterministic is not None:
+            stage("deterministic_candidates.start")
             try: paths.extend(self.deterministic.related_paths(root, query, max(16, top_k * 3)))
             except Exception: pass
+            stage("deterministic_candidates.done")
         if self.code_index is not None:
+            stage("code_index_candidates.start")
             try:
                 for p in self.code_index.related_paths(root, query, max(16, top_k * 3)):
                     if p not in paths: paths.append(p)
             except Exception: pass
+            stage("code_index_candidates.done")
         # Warm preprocessing maintains FTS + semantic cards specifically so agents do
         # not need broad scans. Treat these only as candidates; exact source search
         # remains the fallback when a card/FTS hint produces no matches.
         if self.preprocessor is not None:
+            stage("preprocess_candidates.start")
             try:
                 for p in self.preprocessor.candidate_paths(root, query, max(16, top_k * 3)):
                     if p not in paths:
                         paths.append(p)
             except Exception:
                 pass
+            stage("preprocess_candidates.done")
         def compute() -> dict[str, Any]:
             if paths:
+                stage("targeted_search.start")
                 targeted = (
-                    self.repo_tools.search_paths(root, query, paths, top_k, context_lines=eff_ctx_lines)
+                    self.repo_tools.search_paths(root, query, paths, top_k, context_lines=eff_ctx_lines, **scope_args)
                     if eff_ctx_lines is not None
-                    else self.repo_tools.search_paths(root, query, paths, top_k)
+                    else self.repo_tools.search_paths(root, query, paths, top_k, **scope_args)
                 )
+                stage("targeted_search.done")
             else:
                 targeted = {"results": []}
             used_preprocessed = bool(paths and targeted.get("results"))
-            result = targeted if targeted.get("results") else (
-                self.repo_tools.search(root, query, top_k, context_lines=eff_ctx_lines)
-                if eff_ctx_lines is not None
-                else self.repo_tools.search(root, query, top_k)
-            )
+            if targeted.get("results"):
+                result = targeted
+            else:
+                stage("full_search.start")
+                result = (
+                    self.repo_tools.search(root, query, top_k, context_lines=eff_ctx_lines, **scope_args)
+                    if eff_ctx_lines is not None
+                    else self.repo_tools.search(root, query, top_k, **scope_args)
+                )
+                stage("full_search.done")
             result["preprocessed_hit"] = used_preprocessed
             if enrich:
                 result["enriched"] = True
@@ -2616,14 +2648,19 @@ class LocalAIServices:
             # Exact search snippets become immutable evidence so agent projections can
             # send coordinates first and raw source only for the top few hits.
             if self.evidence_store is not None and isinstance(result.get("results"), list):
+                stage("evidence_store.start")
                 try:
                     result = dict(result)
                     result["results"] = self.evidence_store.put_many(str(result.get("root", root)), result["results"])
                     result["progressive_disclosure"] = True
                 except Exception:
                     pass
+                stage("evidence_store.done")
             return result
-        return self._repo_cached("search", root, {"query": query, "top_k": top_k, "ci": paths[:24], "ctx": eff_ctx_lines}, compute)
+        stage("repo_cache.start")
+        result = self._repo_cached("search", root, {"query": query, "path": scope, "top_k": top_k, "ci": paths[:24], "ctx": eff_ctx_lines}, compute)
+        stage("repo_cache.done")
+        return result
 
     def _refresh_changed_intelligence(self, root: str) -> None:
         """Synchronize only Git-changed files before serving a cache-miss intelligence query.
@@ -4679,13 +4716,23 @@ class LocalAIServices:
             "message": f"Patch syntax {'is valid' if valid else 'is invalid'}; applicability {'was checked' if applicability_checked else 'was not checked'}.",
         }
 
-    def preprocess(self, args: dict[str, Any]) -> dict[str, Any]:
+    def preprocess(self, args: dict[str, Any], progress: Any = None) -> dict[str, Any]:
+        def stage(name: str) -> None:
+            if progress is not None:
+                try:
+                    progress(name)
+                except Exception:
+                    pass
+
         if self.preprocessor is None:
             return {"success": False, "error": "project preprocessor unavailable"}
         action = str(args.get("action", "status")).strip().lower().replace("-", "_")
         root = str(args.get("root", "."))
         if action in {"start", "register", "preprocess"}:
-            return self.preprocessor.register(root, source="agent")
+            stage("preprocess.register.start")
+            result = self.preprocessor.register(root, source="agent", progress=progress)
+            stage("preprocess.register.done")
+            return result
         if action in {"refresh", "force_refresh"}:
             return self.preprocessor.refresh(root)
         if action == "pause":

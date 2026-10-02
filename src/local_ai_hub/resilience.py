@@ -98,6 +98,7 @@ class RecoveryJournal:
         self._changed = threading.Condition(self._lock)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self._reconcile_persisted_responses()
         # A newly constructed journal belongs to a fresh hub process. No request can
         # legitimately still be executing at this point, so any prior "running" row
         # is an interrupted request rather than work to wait for.
@@ -126,6 +127,37 @@ class RecoveryJournal:
             try: self.path.replace(self.path.with_suffix(f".corrupt-{int(time.time())}.sqlite3"))
             except OSError: pass
             self._create_schema()
+
+    def _reconcile_persisted_responses(self) -> int:
+        """Promote running rows whose terminal response was already committed."""
+        with self._lock, closing(self._connect()) as con:
+            rows = con.execute(
+                "SELECT request_id,status_code,response_json FROM requests WHERE state='running' AND response_json<>''"
+            ).fetchall()
+            changed = 0
+            for request_id, raw_status, raw_response in rows:
+                try:
+                    response = json.loads(raw_response)
+                except Exception:
+                    continue
+                if response is None:
+                    continue
+                status_code = int(raw_status or 0)
+                payload = response if isinstance(response, dict) else {}
+                success = bool(payload.get("terminal") or payload.get("in_progress") or (status_code < 400 and payload.get("success") is not False))
+                state = "done" if success else "failed"
+                detail = "" if success else str(payload.get("error") or "request failed")[:500]
+                cur = con.execute(
+                    "UPDATE requests SET state=?,updated_at=?,detail=? WHERE request_id=? AND state='running' AND response_json=?",
+                    (state, time.time(), detail, request_id, raw_response),
+                )
+                changed += int(cur.rowcount or 0)
+            if changed:
+                con.commit()
+                self._changed.notify_all()
+            else:
+                con.rollback()
+            return changed
 
     def begin(self, request_id: str, tenant: str, action: str) -> None:
         now = time.time()
@@ -182,7 +214,32 @@ class RecoveryJournal:
                 response = json.loads(row[4])
             except Exception:
                 response = None
-        return {"state": row[2], "status_code": int(row[3] or 0), "response": response, "updated_at": float(row[5])}
+        state = str(row[2])
+        status_code = int(row[3] or 0)
+        updated_at = float(row[5])
+        if state == "running" and response is not None:
+            payload = response if isinstance(response, dict) else {}
+            success = bool(payload.get("terminal") or payload.get("in_progress") or (status_code < 400 and payload.get("success") is not False))
+            repaired_state = "done" if success else "failed"
+            detail = "" if success else str(payload.get("error") or "request failed")[:500]
+            repaired_at = time.time()
+            with self._lock, closing(self._connect()) as con:
+                cur = con.execute(
+                    "UPDATE requests SET state=?,updated_at=?,detail=? WHERE request_id=? AND state='running' AND response_json=?",
+                    (repaired_state, repaired_at, detail, request_id, row[4]),
+                )
+                if cur.rowcount:
+                    con.commit()
+                    state = repaired_state
+                    updated_at = repaired_at
+                    self._changed.notify_all()
+                else:
+                    con.rollback()
+                    current = con.execute("SELECT state,updated_at FROM requests WHERE request_id=?", (request_id,)).fetchone()
+                    if current:
+                        state = str(current[0])
+                        updated_at = float(current[1])
+        return {"state": state, "status_code": status_code, "response": response, "updated_at": updated_at}
 
     def wait_for(self, request_id: str, tenant: str, action: str, *, timeout_seconds: float) -> dict[str, Any] | None:
         """Wait briefly for active duplicate work, never re-executing it."""

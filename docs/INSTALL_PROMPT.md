@@ -7,6 +7,12 @@ Use this prompt with any AI coding agent (Claude Code, Codex, Cursor, Windsurf, 
 ```markdown
 # TASK: Install, Verify, and Integrate Local AI Hub in Environment & Repository
 
+Repository and reasoning request contracts:
+- `local_ai_repo(action="search", path=...)` restricts every candidate and fallback result to the existing file or directory inside `root`; invalid scopes fail terminally. Single compound identifiers such as `border-top` are literal content queries, not separate `border`/`top` matches. Use source/artifact tools to read a file by its path.
+- `local_ai_task(action="reason")` uses non-empty `task`, falling back to `prompt`; empty assignments fail before inference. `context` remains separate evidence.
+- Model responses remain advisory. Inspect `semantic_quality`, `quality_warning`, and `bypass_reason`; `success=true` alone does not establish factual or logical correctness.
+- After updating runtime modules, restart the HTTP service and reconnect MCP clients so their separate processes load the new adapter.
+
 You are an autonomous AI engineering agent. Your task is to install and configure **Local AI Hub** on this system (if not already installed or running), verify all components (service, configured local backends, token economy suite, code intelligence), ensure MCP integration, and inject the canonical tool and token economy policies into this repository's agent instructions. Ollama is disabled unless explicitly opted in.
 
 Hub adoption telemetry is aggregate-only: retain normalized tool/action/intent/outcome plus time, latency, and output-size buckets. Never send prompts, source, secrets, absolute paths, or raw request records. Mark a bypass only when the client explicitly signals one; do not infer it from missing Hub calls.

@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
+import pytest
 
 from local_ai_hub.code_index import CodeIndex
 from local_ai_hub.config import load_config
@@ -70,6 +71,145 @@ class _IdleScheduler:
 
     def foreground_busy(self):
         return False
+
+
+@pytest.mark.parametrize("phase", ["reuse", "hash"])
+def test_fts_reuse_avoids_correlated_full_scans(tmp_path, monkeypatch, phase):
+    config = _cfg(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "pending.py").write_text("target = 1\n", encoding="utf-8")
+    pre = ProjectPreprocessor(config, _Noop(), _Rag(), _IdleScheduler(), _Noop(), RepositoryTools(config))
+    root = pre._root(str(repo))
+    connect = pre._connect
+    try:
+        with closing(connect()) as con:
+            con.executemany("INSERT INTO source_index VALUES(?,?,?,?,?)", [
+                (root, f"f{i}.py", f"h{i}", "target", 0) for i in range(401)
+            ])
+            con.executemany("INSERT INTO source_fts VALUES(?,?,?)", [
+                (root, f"f{i}.py", "target") for i in range(400)
+            ] + [("other-root", "f400.py", "other"), (root, None, "malformed")])
+            con.execute("INSERT INTO file_refs(root,path,content_hash,size,needs_hash,generation,updated_at) VALUES(?,?,?,?,?,?,?)",
+                        (root, "pending.py", "", 11, 1, 0, 0))
+            con.commit()
+
+        class BudgetConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if not sql.lstrip().startswith("INSERT INTO source_fts"):
+                    return super().execute(sql, parameters)
+                ticks = 0
+                def budget():
+                    nonlocal ticks
+                    ticks += 1
+                    return int(ticks > 100)
+                self.set_progress_handler(budget, 1000)
+                try:
+                    return super().execute(sql, parameters)
+                finally:
+                    self.set_progress_handler(None, 0)
+
+        def bounded_connect():
+            con = sqlite3.connect(pre.db_path, factory=BudgetConnection)
+            con.row_factory = sqlite3.Row
+            return con
+
+        monkeypatch.setattr(pre, "_connect", bounded_connect)
+        monkeypatch.setattr(pre.repo_tools, "git_blob_map", lambda _root: {})
+        if phase == "reuse":
+            pre._link_content_reuse(root)
+        else:
+            pre._step_hash({"root": root, "generation": 0})
+        with closing(connect()) as con:
+            assert con.execute("SELECT count(*) FROM source_fts WHERE root=? AND path='f400.py'", (root,)).fetchone()[0] == 1
+        pre._link_content_reuse(root)
+        with closing(connect()) as con:
+            assert con.execute("SELECT count(*) FROM source_fts WHERE root=? AND path='f400.py'", (root,)).fetchone()[0] == 1
+            assert con.execute("SELECT count(*) FROM source_fts WHERE root='other-root'").fetchone()[0] == 1
+    finally:
+        pre.close()
+
+
+def test_foreground_candidates_read_while_background_lock_is_held(tmp_path):
+    config = _cfg(tmp_path)
+    pre = ProjectPreprocessor(config, _Noop(), _Rag(), _IdleScheduler(), _Noop(), RepositoryTools(config))
+    root = pre._root(str(tmp_path))
+    acquired, release = threading.Event(), threading.Event()
+    def hold():
+        with pre._db_lock, closing(pre._connect()) as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("INSERT INTO source_fts VALUES(?,?,?)", (root, "uncommitted.py", "target"))
+            acquired.set()
+            release.wait(2)
+            con.rollback()
+    holder = threading.Thread(target=hold)
+    try:
+        with closing(pre._connect()) as con:
+            con.execute("INSERT INTO source_fts VALUES(?,?,?)", (root, "target.py", "target"))
+            con.commit()
+        holder.start()
+        assert acquired.wait(1)
+        started = time.monotonic()
+        assert pre.candidate_paths(root, "target") == ["target.py"]
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
+        holder.join(3)
+        pre.close()
+
+
+def test_preprocessor_read_query_has_execution_deadline(tmp_path):
+    config = _cfg(tmp_path)
+    pre = ProjectPreprocessor(config, _Noop(), _Rag(), _IdleScheduler(), _Noop(), RepositoryTools(config))
+    try:
+        started = time.monotonic()
+        with closing(pre._read_connection(deadline=started + 0.02)) as con:
+            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+                con.execute("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n").fetchone()
+        assert time.monotonic() - started < 0.5
+    finally:
+        pre.close()
+
+
+def test_context_deadline_degrades_without_aborting_tool_work(tmp_path, monkeypatch):
+    config = _cfg(tmp_path)
+    pre = ProjectPreprocessor(config, _Noop(), _Rag(), _IdleScheduler(), _Noop(), RepositoryTools(config))
+    def unavailable(**_kwargs):
+        raise sqlite3.OperationalError("interrupted")
+    monkeypatch.setattr(pre, "_read_connection", unavailable)
+    try:
+        result = pre.lookup(str(tmp_path), "target")
+        assert result["degraded"] is True
+        assert result["preprocessed"] is False
+        assert result["files"] == []
+        assert pre.compact_context(str(tmp_path), "target") == ""
+        assert not pre._lookup_cache
+    finally:
+        pre.close()
+
+
+def test_preprocessor_write_lock_wait_is_bounded(tmp_path):
+    config = _cfg(tmp_path)
+    pre = ProjectPreprocessor(config, _Noop(), _Rag(), _IdleScheduler(), _Noop(), RepositoryTools(config))
+    pre._sqlite_busy_seconds = 0.02
+    pre._sqlite_write_retries = 0
+    acquired, release = threading.Event(), threading.Event()
+    def hold():
+        with pre._db_lock:
+            acquired.set()
+            release.wait(2)
+    holder = threading.Thread(target=hold)
+    try:
+        holder.start()
+        assert acquired.wait(1)
+        started = time.monotonic()
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            pre._write_retry(lambda con: con.execute("SELECT 1"))
+        assert time.monotonic() - started < 0.5
+    finally:
+        release.set()
+        holder.join(3)
+        pre.close()
 
 
 class _FailingExternalTools:

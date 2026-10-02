@@ -210,17 +210,38 @@ class ProjectPreprocessor:
             pass
         return con
 
+    def _read_connection(self, *, deadline: float | None = None) -> sqlite3.Connection:
+        """Read a WAL snapshot without queuing behind background Python writers."""
+        deadline = deadline if deadline is not None else time.monotonic() + 1.0
+        if time.monotonic() >= deadline:
+            raise sqlite3.OperationalError("interrupted: preprocessing read deadline")
+        con = self._connect()
+        try:
+            remaining = max(0.001, deadline - time.monotonic())
+            con.execute(f"PRAGMA busy_timeout={max(1, int(min(self._sqlite_busy_seconds, remaining) * 1000))}")
+            con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            con.execute("PRAGMA query_only=ON")
+            return con
+        except Exception:
+            con.close()
+            raise
+
     @staticmethod
     def _is_locked_error(exc: BaseException) -> bool:
         return is_busy_error(exc)
 
     def _write_retry(self, operation: Any) -> Any:
         def attempt() -> Any:
-            with self._db_lock, closing(self._connect()) as con:
-                con.execute("BEGIN IMMEDIATE")
-                value = operation(con)
-                con.commit()
-                return value
+            if not self._db_lock.acquire(timeout=self._sqlite_busy_seconds):
+                raise sqlite3.OperationalError("database is locked: preprocessing writer")
+            try:
+                with closing(self._connect()) as con:
+                    con.execute("BEGIN IMMEDIATE")
+                    value = operation(con)
+                    con.commit()
+                    return value
+            finally:
+                self._db_lock.release()
 
         return retry_busy(
             attempt,
@@ -693,7 +714,7 @@ class ProjectPreprocessor:
             return None
         resolved = self._root(root)
         try:
-            with self._db_lock, closing(self._connect()) as con:
+            with closing(self._read_connection()) as con:
                 row = con.execute("SELECT status,phase,generation,inventory_hash,structural_hash FROM projects WHERE root=? AND paused=0", (resolved,)).fetchone()
             if not row or not row["inventory_hash"]:
                 return None
@@ -718,18 +739,18 @@ class ProjectPreprocessor:
     def indexed_paths(self, root: str) -> list[str]:
         """Return watcher-owned file paths without walking the working tree."""
         resolved = self._root(root)
-        with self._db_lock, closing(self._connect()) as con:
+        with closing(self._read_connection()) as con:
             rows = con.execute(
                 "SELECT path FROM file_refs WHERE root=? ORDER BY path",
                 (resolved,),
             ).fetchall()
         return [str(row[0]) for row in rows]
 
-    def context_revision(self, root: str) -> str:
+    def context_revision(self, root: str, *, deadline: float | None = None) -> str:
         """Cheap revision for local-model answer caching and preprocessed context."""
         resolved = self._root(root)
         try:
-            with self._db_lock, closing(self._connect()) as con:
+            with closing(self._read_connection(deadline=deadline)) as con:
                 p = con.execute("SELECT generation,inventory_hash,structural_hash,status FROM projects WHERE root=?", (resolved,)).fetchone()
                 project = con.execute("SELECT revision_hash FROM project_cards WHERE root=?", (resolved,)).fetchone()
                 cap = con.execute("SELECT MAX(updated_at) FROM task_capsules WHERE root=?", (resolved,)).fetchone()
@@ -795,7 +816,14 @@ class ProjectPreprocessor:
             # turn foreground project registration into a failure.
             pass
 
-    def register(self, root: str, *, force: bool = False, source: str = "agent") -> dict[str, Any]:
+    def register(self, root: str, *, force: bool = False, source: str = "agent", progress: Any = None) -> dict[str, Any]:
+        def stage(name: str) -> None:
+            if progress is not None:
+                try:
+                    progress(name)
+                except Exception:
+                    pass
+
         if not self.enabled:
             return {"success": False, "enabled": False, "error": "preprocessing disabled"}
         resolved = self._root(root)
@@ -837,10 +865,19 @@ class ProjectPreprocessor:
                     (now, str(source or "agent")[:32], resolved),
                 )
             self._rebalance_processing_slots(con, preferred_root=resolved)
+        stage("preprocess.database_register.start")
         self._write_retry(_register_tx)
+        stage("preprocess.database_register.done")
+        stage("preprocess.worktree_discovery.start")
         self._register_discovered_worktrees(resolved)
+        stage("preprocess.worktree_discovery.done")
+        stage("preprocess.wake.start")
         self._wake_all()
-        return self.status(resolved)
+        stage("preprocess.wake.done")
+        stage("preprocess.status.start")
+        result = self.status(resolved)
+        stage("preprocess.status.done")
+        return result
 
     def refresh(self, root: str) -> dict[str, Any]:
         return self.register(root, force=True, source="agent")
@@ -1928,7 +1965,8 @@ class ProjectPreprocessor:
                     """INSERT INTO source_fts(root, path, content)
                        SELECT s.root, s.path, s.path || char(10) || s.text
                        FROM source_index s
-                       WHERE s.root = ? AND NOT EXISTS (SELECT 1 FROM source_fts f WHERE f.root = ? AND f.path = s.path)""",
+                       WHERE s.root = ? AND s.path NOT IN
+                           (SELECT f.path FROM source_fts f WHERE f.root = ? AND f.path IS NOT NULL)""",
                     (root, root),
                 )
             except sqlite3.OperationalError:
@@ -2003,7 +2041,8 @@ class ProjectPreprocessor:
                     """INSERT INTO source_fts(root, path, content)
                        SELECT s.root, s.path, s.path || char(10) || s.text
                        FROM source_index s
-                       WHERE s.root = ? AND NOT EXISTS (SELECT 1 FROM source_fts f WHERE f.root = ? AND f.path = s.path)""",
+                       WHERE s.root = ? AND s.path NOT IN
+                           (SELECT f.path FROM source_fts f WHERE f.root = ? AND f.path IS NOT NULL)""",
                     (root, root),
                 )
             except sqlite3.OperationalError:
@@ -2501,13 +2540,14 @@ class ProjectPreprocessor:
 
     def candidate_paths(self, root: str, query: str, limit: int = 32) -> list[str]:
         """Fast deterministic candidate selection; exact source verification happens later."""
+        deadline = time.monotonic() + 1.0
         resolved = self._root(root)
         terms = self.repo_tools._terms(query)
         paths: list[str] = []
         if terms:
             expression = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms[:12])
             try:
-                with self._db_lock, closing(self._connect()) as con:
+                with closing(self._read_connection(deadline=deadline)) as con:
                     rows = con.execute(
                         "SELECT path FROM source_fts WHERE root=? AND source_fts MATCH ? ORDER BY bm25(source_fts) LIMIT ?",
                         (resolved, expression, max(1, min(int(limit), 64))),
@@ -2517,7 +2557,7 @@ class ProjectPreprocessor:
                 pass
         # Semantic cards cover vocabulary mismatch and FTS-unavailable builds.
         try:
-            cards = self.lookup(resolved, query, limit=max(5, min(int(limit), 16)))
+            cards = self.lookup(resolved, query, limit=max(5, min(int(limit), 16)), deadline=deadline)
             paths.extend(str(x.get("path")) for x in cards.get("files", []) if x.get("path"))
         except Exception:
             pass
@@ -3045,11 +3085,25 @@ class ProjectPreprocessor:
         )
         return True
 
-    def lookup(self, root: str, query: str, limit: int = 5) -> dict[str, Any]:
+    def lookup(self, root: str, query: str, limit: int = 5, *, deadline: float | None = None) -> dict[str, Any]:
+        try:
+            return self._lookup_cards(root, query, limit, deadline=deadline)
+        except sqlite3.Error:
+            # Optional context must not prevent the caller's exact tool fallback.
+            # Do not cache a transiently unavailable snapshot.
+            return {
+                "success": True, "root": self._root(root), "project": {},
+                "modules": [], "files": [], "capsules": [], "preprocessed": False,
+                "context_revision": "cold", "degraded": True,
+                "warning": "preprocessing context read unavailable",
+            }
+
+    def _lookup_cards(self, root: str, query: str, limit: int, *, deadline: float | None = None) -> dict[str, Any]:
         """Return tiny precomputed context without scanning hundreds of cards in Python."""
         resolved = self._root(root)
         terms = set(self.repo_tools._terms(query))
-        revision = self.context_revision(resolved)
+        deadline = deadline if deadline is not None else time.monotonic() + 1.0
+        revision = self.context_revision(resolved, deadline=deadline)
         cache_key = stable_hash({"root": resolved, "query": " ".join(sorted(terms)) or str(query).lower().strip(), "limit": int(limit)})
         now = time.time()
         with self._lookup_cache_lock:
@@ -3057,7 +3111,7 @@ class ProjectPreprocessor:
             if cached and cached[1] == revision and now - cached[0] <= self._lookup_cache_ttl:
                 return copy.deepcopy(cached[2])
 
-        with self._db_lock, closing(self._connect()) as con:
+        with closing(self._read_connection(deadline=deadline)) as con:
             project_row = con.execute("SELECT card_json,revision_hash FROM project_cards WHERE root=?", (resolved,)).fetchone()
             module_rows = con.execute("SELECT module,card_json FROM module_cards WHERE root=?", (resolved,)).fetchall()
             # Let SQLite narrow candidate cards. This avoids JSON-decoding up to 800

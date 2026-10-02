@@ -395,6 +395,41 @@ def test_recovery_journal_waiter_replays_completed_owner_response(tmp_path: Path
     assert result == {"state": "done", "status_code": 200, "response": {"success": True, "value": "reused"}}
 
 
+def test_recovery_journal_repairs_running_row_with_persisted_response(tmp_path: Path):
+    journal = RecoveryJournal(tmp_path / "state")
+    journal.begin("request-repair", "tenant", "/api/search")
+    with closing(journal._connect()) as con:
+        con.execute(
+            "UPDATE requests SET status_code=200,response_json=? WHERE request_id=?",
+            ('{"success":true,"value":"persisted"}', "request-repair"),
+        )
+        con.commit()
+
+    result = journal.lookup("request-repair", "tenant", "/api/search")
+
+    assert result is not None
+    assert result["state"] == "done"
+    assert result["status_code"] == 200
+    assert result["response"] == {"success": True, "value": "persisted"}
+    with closing(journal._connect()) as con:
+        state = con.execute("SELECT state FROM requests WHERE request_id=?", ("request-repair",)).fetchone()[0]
+    assert state == "done"
+
+    journal.begin("request-startup-repair", "tenant", "/api/search")
+    with closing(journal._connect()) as con:
+        con.execute(
+            "UPDATE requests SET status_code=200,response_json=? WHERE request_id=?",
+            ('{"success":true,"value":"startup-persisted"}', "request-startup-repair"),
+        )
+        con.commit()
+
+    restarted = RecoveryJournal(tmp_path / "state")
+    recovered = restarted.lookup("request-startup-repair", "tenant", "/api/search")
+    assert recovered is not None
+    assert recovered["state"] == "done"
+    assert recovered["response"] == {"success": True, "value": "startup-persisted"}
+
+
 def test_memory_lru_preserves_subsecond_ttl():
     import time
     from local_ai_hub.cache import MemoryLRUCache

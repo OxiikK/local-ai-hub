@@ -129,6 +129,35 @@ def test_client_replays_duplicate_request_until_owner_finishes(tmp_path, monkeyp
     assert calls == 2
 
 
+def test_client_waits_for_owner_after_replayed_request_returns_in_progress(tmp_path, monkeypatch):
+    client = _client(tmp_path)
+    calls = 0
+    request_ids = []
+
+    def pooled_open(*args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        request_ids.append(args[3]["X-LocalAI-Request-ID"])
+        if calls == 1:
+            raise client_module.http.client.RemoteDisconnected("connection closed after request")
+        if calls == 2:
+            raise HTTPError(
+                "http://127.0.0.1/api/search",
+                409,
+                "Conflict",
+                {},
+                BytesIO(b'{"success":false,"retryable":true,"in_progress":true,"retry_after_seconds":0.01}'),
+            )
+        return b'{"success":true,"value":"owner-result"}'
+
+    monkeypatch.setattr(client, "_pooled_open", pooled_open)
+    result = client.request("/api/search", {"root": "repo"}, timeout=0.5)
+
+    assert result == {"success": True, "value": "owner-result"}
+    assert calls == 3
+    assert len(set(request_ids)) == 1
+
+
 def test_client_close_closes_connections_created_by_worker_threads(tmp_path, monkeypatch):
     class Response:
         status = 200

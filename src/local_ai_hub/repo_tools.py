@@ -129,6 +129,38 @@ class RepositoryTools:
             raise ValueError(f"root directory does not exist: {path}")
         return path
 
+    @staticmethod
+    def _search_scope(base: Path, path: str = "") -> Path:
+        target = (base / str(path).replace("\\", "/")).resolve(strict=False)
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise ValueError("search path must stay inside repository root") from exc
+        if not target.exists() or not (target.is_file() or target.is_dir()):
+            raise ValueError(f"search path does not exist: {path}")
+        return target
+
+    @classmethod
+    def normalize_search_scope(cls, root: str, path: str = "") -> str:
+        """Validate scope and return one stable root-relative cache identity."""
+        base = cls._root(root)
+        rel = cls._search_scope(base, path).relative_to(base).as_posix()
+        return "" if rel == "." else rel
+
+    @staticmethod
+    def _in_search_scope(base: Path, target: Path, scope: Path) -> bool:
+        try:
+            target.relative_to(base)
+            target.relative_to(scope) if scope.is_dir() else target.relative_to(scope.parent)
+        except ValueError:
+            return False
+        return scope.is_dir() or target == scope
+
+    @staticmethod
+    def _invalid_search_scope(base: Path, exc: ValueError) -> dict[str, Any]:
+        return {"success": False, "root": str(base), "results": [],
+                "error": str(exc), "terminal": True, "retryable": False}
+
     def _git_files(self, root: Path) -> list[Path] | None:
         """Return tracked + untracked files using bounded, coalesced Git probes.
 
@@ -668,13 +700,28 @@ class RepositoryTools:
     def _terms(query: str) -> list[str]:
         return [t.lower() for t in tokenize_query_terms(query, min_len=2, max_terms=20)]
 
-    def _ripgrep_candidates(self, base: Path, terms: list[str], max_matches: int) -> tuple[list[tuple[str, int]] | None, bool]:
+    def _search_terms(self, query: str) -> tuple[list[str], str]:
+        phrase = query.strip().lower()
+        literal = phrase if phrase and not re.search(r"\s", phrase) and re.search(r"[-_/.:]", phrase) else ""
+        return ([literal] if literal else self._terms(query)), literal
+
+    @staticmethod
+    def _line_matches(line: str, terms: list[str], literal: str) -> list[str]:
+        if literal:
+            # Keep a CSS/property/path identifier intact. A hyphen suffix such as
+            # border-top-left is relevant; xborder-top and topology are not.
+            return [literal] if re.search(r"(?<![\w])" + re.escape(literal) + r"(?![\w])", line) else []
+        return [term for term in terms if term in line]
+
+    def _ripgrep_candidates(self, base: Path, terms: list[str], max_matches: int, path: str = "") -> tuple[list[tuple[str, int]] | None, bool]:
         if not self._rg or not terms:
             return None, False
-        cmd = [self._rg, "--json", "--ignore-case", "--max-count", str(max(2, self.max_snippets_per_file * 3))]
+        cmd = [self._rg, "--json", "--fixed-strings", "--ignore-case", "--max-count", str(max(2, self.max_snippets_per_file * 3))]
+        if len(terms) == 1 and re.search(r"[-_/.:]", terms[0]):
+            cmd.append("--word-regexp")
         for term in terms[:12]:
             cmd.extend(["-e", term])
-        cmd.append(str(base))
+        cmd.append(str(self._search_scope(base, path)))
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.ripgrep_timeout, check=False, encoding="utf-8", errors="replace", **hidden_run_kwargs())
         except Exception:
@@ -712,7 +759,7 @@ class RepositoryTools:
                 break
         return out, False
 
-    def _git_grep_candidates(self, base: Path, terms: list[str], max_matches: int) -> tuple[list[tuple[str, int]] | None, bool]:
+    def _git_grep_candidates(self, base: Path, terms: list[str], max_matches: int, path: str = "") -> tuple[list[tuple[str, int]] | None, bool]:
         """Fast portable fallback when ripgrep is unavailable.
 
         `git grep` covers tracked files and is used only as a bounded accelerator. A
@@ -726,10 +773,14 @@ class RepositoryTools:
             if time.monotonic() < self._git_grep_slow_until.get(key, 0.0):
                 self._git_stats["grep_cooldown_skips"] += 1
                 return None, False
-        cmd = ["git", "-C", str(base), "grep", "-n", "-I", "-i", "--no-color", "--full-name"]
+        cmd = ["git", "-C", str(base), "grep", "-n", "-I", "-i", "-F", "--no-color", "--full-name"]
+        if len(terms) == 1 and re.search(r"[-_/.:]", terms[0]):
+            cmd.append("-w")
         for term in terms[:12]:
             cmd.extend(["-e", term])
         cmd.append("--")
+        if path:
+            cmd.append(":(literal)" + path)
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=self.git_grep_timeout,
@@ -768,9 +819,15 @@ class RepositoryTools:
                 break
         return out, False
 
-    def search(self, root: str, query: str, top_k: int = 12, context_lines: int | None = None) -> dict[str, Any]:
+    def search(self, root: str, query: str, top_k: int = 12, context_lines: int | None = None, path: str = "") -> dict[str, Any]:
         base = self._root(root)
-        terms = self._terms(query)
+        try:
+            scope = self._search_scope(base, path)
+        except ValueError as exc:
+            return self._invalid_search_scope(base, exc)
+        normalized_path = scope.relative_to(base).as_posix()
+        scoped_args = {"path": normalized_path} if scope != base else {}
+        terms, literal = self._search_terms(query)
         phrase = query.strip().lower()
         if not terms and not phrase:
             return {"success": True, "root": str(base), "results": []}
@@ -778,12 +835,12 @@ class RepositoryTools:
         hits: list[dict[str, Any]] = []
         scanned = 0
         candidate_engine = "python"
-        candidates, accelerator_failed = self._ripgrep_candidates(base, terms, self.max_hits * 4)
+        candidates, accelerator_failed = self._ripgrep_candidates(base, terms, self.max_hits * 4, **scoped_args)
         accelerated = candidates is not None
         if accelerated:
             candidate_engine = "ripgrep"
         else:
-            candidates, git_grep_failed = self._git_grep_candidates(base, terms, self.max_hits * 4)
+            candidates, git_grep_failed = self._git_grep_candidates(base, terms, self.max_hits * 4, **scoped_args)
             accelerator_failed = accelerator_failed or git_grep_failed
             accelerated = candidates is not None
             if accelerated:
@@ -794,6 +851,8 @@ class RepositoryTools:
                 per_path_lines.setdefault(rel, []).append(line_no)
             for rel, line_numbers in per_path_lines.items():
                 path = (base / rel).resolve(strict=False)
+                if not self._in_search_scope(base, path, scope):
+                    continue
                 try:
                     file_hash, lines = self._read_snapshot(path)
                 except Exception:
@@ -804,7 +863,9 @@ class RepositoryTools:
                     idx = line_no - 1
                     if idx < 0 or idx >= len(lines): continue
                     low = lines[idx].lower()
-                    matched = [t for t in terms if t in low]
+                    matched = self._line_matches(low, terms, literal)
+                    if not matched:
+                        continue
                     path_matches = sum(1 for t in terms if t in path_lower)
                     score = float(len(matched) * 3 + path_matches * 2 + sum(min(low.count(t), 3) * 0.5 for t in matched))
                     if phrase and len(phrase) <= 120 and phrase in low: score += 8
@@ -825,7 +886,11 @@ class RepositoryTools:
                 "retryable": True,
             }
         if not hits and not accelerated:
-            for path in self.iter_files(str(base)):
+            inventory = self.iter_files(str(scope)) if scope.is_dir() else [scope]
+            for path in inventory:
+                path = path.resolve(strict=False)
+                if not self._in_search_scope(base, path, scope):
+                    continue
                 scanned += 1
                 rel = str(path.relative_to(base)).replace("\\", "/")
                 path_lower = rel.lower()
@@ -835,16 +900,16 @@ class RepositoryTools:
                     continue
                 for idx, line in enumerate(lines):
                     low = line.lower()
-                    matched = [t for t in terms if t in low]
+                    matched = self._line_matches(low, terms, literal)
                     path_matches = sum(1 for t in terms if t in path_lower)
-                    if not matched and not path_matches:
+                    if not matched:
                         continue
                     score = float(len(matched) * 3 + path_matches * 2)
                     if phrase and len(phrase) <= 120 and phrase in low:
                         score += 8
                     score += sum(min(low.count(t), 3) * 0.5 for t in matched)
-                    start = max(0, idx - self.snippet_lines)
-                    end = min(len(lines), idx + self.snippet_lines + 1)
+                    start = max(0, idx - effective_snippet_lines)
+                    end = min(len(lines), idx + effective_snippet_lines + 1)
                     snippet = "\n".join(f"{n + 1}: {lines[n]}" for n in range(start, end))
                     hits.append({
                         "path": rel, "start_line": start + 1, "end_line": end,
@@ -1453,10 +1518,14 @@ class RepositoryTools:
 
 
 
-    def search_paths(self, root: str, query: str, paths: list[str], top_k: int = 10, context_lines: int | None = None) -> dict[str, Any]:
+    def search_paths(self, root: str, query: str, paths: list[str], top_k: int = 10, context_lines: int | None = None, path: str = "") -> dict[str, Any]:
         """Search only preselected files. Used with preprocessed semantic cards to avoid full-repo scans."""
         base = self._root(root)
-        terms = self._terms(query)
+        try:
+            scope = self._search_scope(base, path)
+        except ValueError as exc:
+            return self._invalid_search_scope(base, exc)
+        terms, literal = self._search_terms(query)
         phrase = query.strip().lower()
         effective_snippet_lines = max(1, min(int(context_lines), 40)) if context_lines is not None else self.snippet_lines
         hits: list[dict[str, Any]] = []
@@ -1468,9 +1537,7 @@ class RepositoryTools:
                 continue
             seen_paths.add(rel)
             path = (base / rel).resolve(strict=False)
-            try:
-                path.relative_to(base)
-            except ValueError:
+            if not self._in_search_scope(base, path, scope):
                 continue
             if not path.is_file():
                 continue
@@ -1482,9 +1549,9 @@ class RepositoryTools:
             path_lower = rel.lower()
             for idx, line in enumerate(lines):
                 low = line.lower()
-                matched = [t for t in terms if t in low]
+                matched = self._line_matches(low, terms, literal)
                 path_matches = sum(1 for t in terms if t in path_lower)
-                if not matched and not path_matches:
+                if not matched:
                     continue
                 score = float(len(matched) * 3 + path_matches * 2)
                 if phrase and len(phrase) <= 120 and phrase in low:

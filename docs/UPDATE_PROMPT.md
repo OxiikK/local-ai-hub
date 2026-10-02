@@ -9,6 +9,12 @@ Preserve profile-aware model routing when refreshing repository instructions: in
 ```markdown
 # TASK: Upgrade Local AI Hub from V3 to V4 and Refresh Repository Instructions
 
+Repository and reasoning request contracts:
+- `local_ai_repo(action="search", path=...)` restricts every candidate and fallback result to the existing file or directory inside `root`; invalid scopes fail terminally. Single compound identifiers such as `border-top` are literal content queries, not separate `border`/`top` matches. Use source/artifact tools to read a file by its path.
+- `local_ai_task(action="reason")` uses non-empty `task`, falling back to `prompt`; empty assignments fail before inference. `context` remains separate evidence.
+- Model responses remain advisory. Inspect `semantic_quality`, `quality_warning`, and `bypass_reason`; `success=true` alone does not establish factual or logical correctness.
+- After updating runtime modules, restart the HTTP service and reconnect MCP clients so their separate processes load the new adapter.
+
 You are an autonomous AI engineering agent. Your task is to upgrade **Local AI Hub** from V3 to V4 on this system using the canonical `master` branch, update dependencies, restart the background service, re-verify health, and refresh the Local AI Hub Tool Policy and Token Economy Policy in this repository.
 
 Preserve privacy-safe adoption telemetry: it contains only normalized aggregate tool/action/intent/outcome, time, latency, and output-size buckets. Never migrate or expose prompts, source, secrets, absolute paths, or raw request records. Bypasses require an explicit client signal.

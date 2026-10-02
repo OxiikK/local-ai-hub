@@ -61,6 +61,32 @@ def test_repo_search_reuses_cache_for_equivalent_query_whitespace_and_case(tmp_p
     assert second["cache_hit"] is True
 
 
+def test_repo_search_reports_bounded_progress_stages(tmp_path: Path):
+    class _Tools:
+        def search(self, _root, query, top_k, context_lines=None):
+            return {"success": True, "query": query, "results": []}
+
+        def search_paths(self, *_args, **_kwargs):
+            return {"success": True, "results": []}
+
+    services = LocalAIServices.__new__(LocalAIServices)
+    services.repo_flight = _Flight()
+    services._touch_project = lambda _root: None
+    services._repo_cache_state = lambda _root: {"fingerprint": "rev", "kind": "filesystem"}
+    services.repo_tools = _Tools()
+    services.learner = services.deterministic = services.code_index = services.preprocessor = None
+    services.evidence_store = None
+    stages: list[str] = []
+
+    result = services.repo_search(str(tmp_path), "target", progress=stages.append)
+
+    assert result["success"] is True
+    assert stages == [
+        "repo_cache.start",
+        "full_search.start", "full_search.done", "repo_cache.done",
+    ]
+
+
 def test_enriched_repo_search_returns_symbol_and_evidence_for_hit(tmp_path: Path, monkeypatch):
     class _Tools:
         def search(self, _root, _query, _top_k, context_lines=None):

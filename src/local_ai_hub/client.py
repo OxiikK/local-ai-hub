@@ -347,7 +347,8 @@ class HubClient:
 
         def execute() -> dict[str, Any]:
             duplicate_deadline = time.monotonic() + timeout
-            try:
+
+            def request_until_terminal() -> dict[str, Any]:
                 while True:
                     try:
                         return once()
@@ -361,8 +362,9 @@ class HubClient:
                             return result
                         retry_after = max(0.01, float(result.get("retry_after_seconds", 0.1) or 0.1))
                         time.sleep(min(retry_after, remaining))
-            except HTTPError as exc:
-                return self._error_response(exc, request_id)
+
+            try:
+                return request_until_terminal()
             except (URLError, OSError, http.client.HTTPException) as exc:
                 self._drop_connection()
                 # A local hub can disappear between ensure_server() and the response,
@@ -371,7 +373,7 @@ class HubClient:
                 if replay_safe:
                     server_ready = self.ensure_server() if self.auto_start else True
                     if server_ready:
-                        try: return once()
+                        try: return request_until_terminal()
                         except HTTPError as retry_http: return self._error_response(retry_http, request_id)
                         except Exception as retry_exc: return {"success": False, "error": str(retry_exc), "request_id": request_id, "retried": True}
                 return {"success": False, "error": str(exc), "request_id": request_id}

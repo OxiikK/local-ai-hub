@@ -48,6 +48,8 @@ def assess_semantic_result(
     task: str,
     evidence_paths: Iterable[str],
     output: Any,
+    *,
+    context: str = "",
 ) -> dict[str, Any]:
     """Return a bounded quality decision without claiming semantic truth.
 
@@ -64,6 +66,8 @@ def assess_semantic_result(
     paths, path_error = _bounded_paths(evidence_paths)
     if path_error:
         return _reject(path_error)
+    if not paths:
+        paths = _extract_paths(task + "\n" + context[:MAX_OUTPUT_CHARS])[:MAX_EVIDENCE_PATHS]
 
     text, output_error = _model_text(output)
     if output_error:
